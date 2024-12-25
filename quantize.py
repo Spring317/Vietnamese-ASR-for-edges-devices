@@ -1,4 +1,5 @@
 import torch
+from torch.ao.quantization import quantize_dynamic
 import tvm
 from tvm import relay, auto_scheduler
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
@@ -13,6 +14,7 @@ from typing import List
 class ModelWrapper(torch.nn.Module):
     """
     This class returns the last hidden state of the model
+    -----------------------------------------------------
     Parameters:
         model: torch.nn.Module: the model to be wrapped
     """
@@ -27,6 +29,7 @@ class ModelWrapper(torch.nn.Module):
 class Audio:
     """
     This class is used to preprocess audio for preprocessing process
+    ---------------------------------------------------------------
     Parameters: 
         prompt: str: the prompt of the audio
         processor: str: the processor of the audio
@@ -75,91 +78,95 @@ class Audio:
         return inputs
     
 class Quantize:
-    def __init__(self, model: str, target: str, bit_width: int = 8, calibration_samples: int = 1000) -> None:
+    """"
+    Quantize model to int8
+    Hyperparameters:
+        model_name: str: the model name
+    Return:
+        torch.nn.Module: the quantized model
+    """    
+        
+    def __init__(self, model_name: str) -> torch.nn.Module:
+        self.__model = Wav2Vec2Model.from_pretrained(model_name)
+        
+    def quantize(self) -> torch.nn.Module:    
+        quantized_model = quantize_dynamic(self.__model, {torch.nn.Linear}, dtype=torch.qint8)
+        return quantized_model
+    
+
+class Deployment:
+    """Deploy the model to llvm by using tvm
+    ----------------------------------------------------
+    Hyperparameters:
+        model: torch.nn.Module: the model to be deployed
+        target: str: the target of the deployment
+    Return:
+        tvm.relay: the relay model
+    """
+
+    def __init__(self, model: torch.nn.Module, target: str) -> tvm.relay:
         self.__model = model
         self.__target = target
-        self.__bit_width = bit_width
-        self.__calibration_samples = calibration_samples
+    
+    def deploy(self, inputs: List) -> tvm.relay:
+        """This method deploy model to llvm using tvm
+        -------------------------------------------------
+        Parameters:
+            inputs: List: the input of the model
+        Return:
+            tvm.relay: the relay model"""
 
-    def quantize(self, inputs: List) -> None:
-        # Load and prepare model
-        model = Wav2Vec2Model.from_pretrained(self.__model)
-        model.eval()
-        model.to('cpu')
-
-        # Verify input shape
-        sample_input = inputs[0]
-        if not isinstance(sample_input, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor, got {type(sample_input)}")
-            
-        print(f"Input tensor shape: {sample_input.shape}")
+        model = ModelWrapper(self.__model)
+        traced_model = torch.jit.trace(model, inputs[0])
         
-        # Ensure input has the correct dimensions (batch_size, sequence_length)
-        # if len(sample_input.shape) != 3:  # Should be [1, 1, sequence_length]
-        #     sample_input = sample_input.unsqueeze(0)
-            
-        # print(f"Adjusted input shape: {sample_input.shape}")
-
-        wrapped_model = ModelWrapper(model)
-        
-        # Trace with explicit example input
-        traced_model = torch.jit.trace(wrapped_model, sample_input)
-        
-        # Define input shape explicitly
-        input_name = 'input'
-        shape_list = [(input_name, tuple(sample_input.shape))]
-        print(f"Shape list for Relay: {shape_list}")
-
-        # Convert to Relay with explicit shapes
+        input_shape = inputs[0].shape
+        shape_list = [(f'input', input_shape)]
         mod, params = relay.frontend.from_pytorch(traced_model, shape_list)
-
-        # Print the Relay module for debugging
-        print("Relay module:")
-        # print(mod)
-
-        # Create target
-        target = tvm.target.Target(self.__target)
         
-        # Configure quantization
         with tvm.transform.PassContext(opt_level=3):
-            with relay.quantize.qconfig(calibrate_mode="global_scale",
-                                      global_scale=8.0,
-                                      nbit_input=self.__bit_width,
-                                      nbit_weight=self.__bit_width,
-                                      dtype_input="int8",
-                                      dtype_weight="int8",
-                                      dtype_activation="int8"):
-                # Apply quantization
-                qmod = relay.quantize.quantize(mod, params)
-                
-        # Build the quantized model
-        with tvm.transform.PassContext(opt_level=3):
-            lib = relay.build(qmod, target=target, params=params)
-            
-        # Save the quantized model
-        lib.export_library("quantized_model.tar")
-        print("Quantized model saved as quantized_model.tar")
+            lib = relay.build(mod, target=self.__target, params=params)
+        return lib
 
-        # Create graph executor for testing
-        dev = tvm.device(str(target), 0)
-        module = graph_executor.GraphModule(lib["default"](dev))
-        
-        # Test inference with properly shaped input
-        input_data = sample_input.numpy()
-        module.set_input(input_name, input_data)
-        module.run()
-        output = module.get_output(0)
-        print(f"Output shape: {output.shape}")
-        
-        
+    def compile(self, lib: tvm.relay) -> graph_executor.GraphModule:
+        """This method is used to compile the model
+        -------------------------------------------
+        Parameters:
+            lib: tvm.relay: the relay model
+        Return:
+            graph_executor.GraphModule: the compiled model
+        """
+        m = graph_executor.GraphModule(lib['default'](tvm.cpu(0)))
+        return m
+    
+    def run(self, m: graph_executor.GraphModule, inputs: List) -> np.ndarray:
+        """This method is used to run the model
+        ---------------------------------------
+        Parameters:
+            m: graph_executor.GraphModule: the compiled model
+            inputs: List: the input of the model
+        Return:
+            np.ndarray: the output of the model
+        """
+        m.set_input('input0', inputs[0].numpy())
+        m.run()
+        return m.get_output(0).asnumpy()
+    
     
 def main():
     audio = Audio('prompts.txt', 'khanhld/wav2vec2-base-vietnamese-160h')
     audio.get_audio_path()
     inputs = audio.preprocess()
 
-    quantize = Quantize('khanhld/wav2vec2-base-vietnamese-160h','llvm')
-    quantize.quantize(inputs)
+    quantize = Quantize('khanhld/wav2vec2-base-vietnamese-160h')
+    quantized_model = quantize.quantize()
+
+    deployment = Deployment(quantized_model, 'llvm')
+    
+    lib = deployment.deploy(inputs)
+    m = deployment.compile(lib)
+    output = deployment.run(m, inputs)
+    print(output) 
+
 
 if __name__ == '__main__':
     main()
