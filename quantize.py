@@ -1,8 +1,9 @@
 import torch
 from torch.ao.quantization import quantize_dynamic
+from optimum.quanto import quantize, qint8
 import tvm
 from tvm import relay, auto_scheduler
-from transformers import Wav2Vec2Model, Wav2Vec2Processor
+from transformers import Wav2Vec2Model, Wav2Vec2Processor, QuantoConfig
 import numpy as np
 from tvm.contrib import graph_executor
 from tvm.driver import tvmc
@@ -87,12 +88,15 @@ class Quantize:
     """    
         
     def __init__(self, model_name: str) -> torch.nn.Module:
-        self.__model = Wav2Vec2Model.from_pretrained(model_name)
+        quantize_config = QuantoConfig(weights="int8")
+        self.__model = Wav2Vec2Model.from_pretrained(model_name, quantization_config=quantize_config)
         
     def quantize(self) -> torch.nn.Module:    
-        quantized_model = quantize_dynamic(self.__model, {torch.nn.Linear}, dtype=torch.qint8)
-        return quantized_model
+        # quantized_model = quantize_dynamic(self.__model, {torch.nn.Linear}, dtype=torch.qint8)
+        return self.__model
     
+    # def quanto_optims(self):
+        r
 
 class Deployment:
     """Deploy the model to llvm by using tvm
@@ -153,11 +157,12 @@ class Deployment:
     
     
 def main():
-    audio = Audio('prompts.txt', 'khanhld/wav2vec2-base-vietnamese-160h')
+    model_name = 'khanhld/wav2vec2-base-vietnamese-160h'
+    audio = Audio('prompts.txt', model_name)
     audio.get_audio_path()
     inputs = audio.preprocess()
 
-    quantize = Quantize('khanhld/wav2vec2-base-vietnamese-160h')
+    quantize = Quantize(model_name)
     quantized_model = quantize.quantize()
 
     deployment = Deployment(quantized_model, 'llvm')
