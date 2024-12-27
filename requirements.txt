@@ -2,3 +2,7 @@ torch
 transformers 
 numpy
 librosa
+optimum-quanto
+accelerate
+onnx
+onnxruntime
