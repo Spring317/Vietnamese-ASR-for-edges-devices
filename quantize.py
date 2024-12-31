@@ -1,15 +1,16 @@
 import torch
 from torch.ao.quantization import quantize_dynamic
-from optimum.quanto import quantize, qint8
 import tvm
 from tvm import relay, auto_scheduler
-from transformers import Wav2Vec2Model, Wav2Vec2Processor, QuantoConfig
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, QuantoConfig
 import numpy as np
 from tvm.contrib import graph_executor
 from tvm.driver import tvmc
 import librosa
 import json
-from typing import List
+from typing import List, Dict
+from onnxruntime.transformers import optimizer
+import onnx
 
 
 class ModelWrapper(torch.nn.Module):
@@ -27,6 +28,7 @@ class ModelWrapper(torch.nn.Module):
         outputs = self.model(x)
         return outputs.last_hidden_state
 
+
 class Audio:
     """
     This class is used to preprocess audio for preprocessing process
@@ -35,6 +37,7 @@ class Audio:
         prompt: str: the prompt of the audio
         processor: str: the processor of the audio
     """
+    
     def __init__(self, prompt: str, processor: str) -> None:
         self.__prompt = prompt
         self.__processor = Wav2Vec2Processor.from_pretrained(processor)
@@ -78,6 +81,7 @@ class Audio:
             inputs.append(input_values)
         return inputs
     
+
 class Quantize:
     """"
     Quantize model to int8
@@ -87,16 +91,27 @@ class Quantize:
         torch.nn.Module: the quantized model
     """    
         
-    def __init__(self, model_name: str) -> torch.nn.Module:
+    def __init__(self, model_name: str):
         quantize_config = QuantoConfig(weights="int8")
-        self.__model = Wav2Vec2Model.from_pretrained(model_name, quantization_config=quantize_config)
+        # self.__model = Wav2Vec2ForCTC.from_pretrained(model_name, quantization_config=quantize_config)
+        self.__model = Wav2Vec2ForCTC.from_pretrained(model_name)
         
-    def quantize(self) -> torch.nn.Module:    
-        # quantized_model = quantize_dynamic(self.__model, {torch.nn.Linear}, dtype=torch.qint8)
+    def quantize(self) -> torch.nn.Module:
+        """Return quantized_model"""    
         return self.__model
     
-    # def quanto_optims(self):
-        r
+    def export_to_onnx(self) -> None:
+        """Export model into onnx format"""
+        dummy_input = torch.randn(1, 16000)
+        input_names = ["audio"]
+        output_names = ["text"]
+        torch.onnx.export(self.__model, dummy_input, "wav2vec2.onnx", input_names=input_names, output_names=output_names, opset_version=14)
+
+    def optimize_model(self) -> None:
+        """Optimize quantized model for cpu deployment"""
+        optimized_model = optimizer.optimize_model('wav2vec2.onnx', model_type='wav2vec2', num_heads=12, hidden_size=768)
+        optimized_model.save_model_to_file('wav2vec2_optimized.onnx')
+
 
 class Deployment:
     """Deploy the model to llvm by using tvm
@@ -108,53 +123,45 @@ class Deployment:
         tvm.relay: the relay model
     """
 
-    def __init__(self, model: torch.nn.Module, target: str) -> tvm.relay:
+    def __init__(self, model: torch.nn.Module, target: str) -> None:
         self.__model = model
         self.__target = target
     
-    def deploy(self, inputs: List) -> tvm.relay:
-        """This method deploy model to llvm using tvm
-        -------------------------------------------------
+    def run_tvm_model(self, mod: tvm.relay, params: Dict, input_name: str, inp: List, target= 'llvm') -> tuple:
+        """
+        Run pre-quantized model by tvm
+        -------------------------------
         Parameters:
-            inputs: List: the input of the model
-        Return:
-            tvm.relay: the relay model"""
+            mod: tvm.relay: the relay model
+            params: dict: the parameters of the model
+            input_name: str: the input name of the model
+            inp: List: the input of the model
+            target: str: the target of the deployment
+        """
 
-        model = ModelWrapper(self.__model)
-        traced_model = torch.jit.trace(model, inputs[0])
-        
-        input_shape = inputs[0].shape
-        shape_list = [(f'input', input_shape)]
-        mod, params = relay.frontend.from_pytorch(traced_model, shape_list)
-        
         with tvm.transform.PassContext(opt_level=3):
-            lib = relay.build(mod, target=self.__target, params=params)
-        return lib
+            lib = relay.build(mod, target, params=params)
+            runtime = graph_executor.GraphModule(lib['default'](tvm.cpu(0)))
+            runtime.set_input(input_name, inp)
+            runtime.run()
+            return runtime.get_output(0).asnumpy(), runtime
+        
+    def deploy(self, inputs: List) -> tvm.relay:
+        """
+        Deploy the model to llvm
+        ------------------------
+        Parameters:
+            inputs: List: the inputs of the model
+        """
+        model = ModelWrapper(self.__model)
+        # model = self.__model
+        model.eval()
+        traced_model = torch.jit.trace(model, (inputs[0]))
+        input_name=  'input'
+        input_shapes = [(input_name, inputs[0].shape)]
+        mod, params = relay.frontend.from_pytorch(traced_model, input_shapes)
 
-    def compile(self, lib: tvm.relay) -> graph_executor.GraphModule:
-        """This method is used to compile the model
-        -------------------------------------------
-        Parameters:
-            lib: tvm.relay: the relay model
-        Return:
-            graph_executor.GraphModule: the compiled model
-        """
-        m = graph_executor.GraphModule(lib['default'](tvm.cpu(0)))
-        return m
-    
-    def run(self, m: graph_executor.GraphModule, inputs: List) -> np.ndarray:
-        """This method is used to run the model
-        ---------------------------------------
-        Parameters:
-            m: graph_executor.GraphModule: the compiled model
-            inputs: List: the input of the model
-        Return:
-            np.ndarray: the output of the model
-        """
-        m.set_input('input0', inputs[0].numpy())
-        m.run()
-        return m.get_output(0).asnumpy()
-    
+        return mod, params
     
 def main():
     model_name = 'khanhld/wav2vec2-base-vietnamese-160h'
@@ -164,14 +171,21 @@ def main():
 
     quantize = Quantize(model_name)
     quantized_model = quantize.quantize()
-
-    deployment = Deployment(quantized_model, 'llvm')
     
-    lib = deployment.deploy(inputs)
-    m = deployment.compile(lib)
-    output = deployment.run(m, inputs)
-    print(output) 
-
+    #export onnx
+    quantize.export_to_onnx()
+    quantize.optimize_model()
+    
+    #load optimized model and give prediction
+    # optimized_model = onnx.load('wav2vec2_optimized.onnx')
+    # onnx.checker.check_model(optimized_model)
+    print("ONNX export completed and verified")
+    print("Model optimization completed")
+    # print(optimized_model)
+    # deployment = Deployment(quantized_model, 'llvm')
+    # mod, params = deployment.deploy(inputs)
+    # output, runtime = deployment.run_tvm_model(mod, params, 'input', inputs)
+    # print("tvm output: ", output)   
 
 if __name__ == '__main__':
     main()
