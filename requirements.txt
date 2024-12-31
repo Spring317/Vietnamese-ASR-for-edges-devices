@@ -6,3 +6,7 @@ optimum-quanto
 accelerate
 onnx
 onnxruntime
+openvino
+nncf
+optimum[intel]
+optimum[exporters]
