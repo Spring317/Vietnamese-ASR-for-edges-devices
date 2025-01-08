@@ -8,5 +8,5 @@ onnx
 onnxruntime
 openvino
 nncf
-optimum[intel]
 optimum[exporters]
+jiwer
