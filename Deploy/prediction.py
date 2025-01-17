@@ -1,8 +1,5 @@
-import numpy as np
 import torch
-from jiwer import wer
 from optimum.onnxruntime import ORTModelForCTC
-from optimum.onnxruntime import  ORTModelForCTC
 from DataPreprocessing.encode import Encoder
 
 

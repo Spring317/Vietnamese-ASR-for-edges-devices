@@ -1,10 +1,24 @@
 from prediction import Prediction
+from DataPreprocessing.recorder import Recorder
+import gc
+def main():   
+    try:
+        while True:
+            rec = Recorder()
+            print("Recording...")
+            chunk = rec.record()
+            pred = Prediction(chunk)
+            print(pred.predict())
+            
+            del chunk
+            del rec
+            gc.collect()
 
-def main():
-   
-    file_path = "G:/Vietnamese-ASR-for-edges-devices/Deploy/Test_audio/VIVOSSPK01_R003.wav"
-    pred = Prediction(file_path)
-    print(pred.predict())
+    except KeyboardInterrupt:
+        print("Recording stopped")
+    
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
-if '__name__' == '__main__':
+if __name__ == '__main__':
     main()
